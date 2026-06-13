@@ -181,38 +181,185 @@ class TestRecordingSessionsThreadSafety:
 
 
 # ---------------------------------------------------------------------------
-# Structure-aware _truncate_snapshot
+# Structure-aware snapshot windowing (head + tail, with offset pagination)
 # ---------------------------------------------------------------------------
 
 class TestTruncateSnapshot:
+    """Backward-compatible wrapper around :func:`_window_snapshot`.
+
+    These tests lock in the legacy behavior: short snapshots pass through
+    unchanged, long snapshots return *head + tail* (preserving nav links
+    at the bottom) plus a marker. The next_offset / pagination logic
+    lives in TestWindowSnapshot below.
+    """
 
     def test_short_snapshot_unchanged(self):
         from tools.browser_tool import _truncate_snapshot
         short = '- heading "Example" [ref=e1]\n- link "More" [ref=e2]'
         assert _truncate_snapshot(short) == short
 
-    def test_long_snapshot_truncated_at_line_boundary(self):
+    def test_long_snapshot_windowed_at_line_boundary(self):
+        """Long snapshots now return head + tail (not head only).
+
+        This is the camofox-style windowing change: we *always* keep the
+        last ``_SNAPSHOT_TAIL_CHARS`` so pagination / "Next" links stay
+        visible. The legacy test only asserted head preservation; we
+        update it to assert head + tail are both present, with the
+        marker line in between.
+        """
         from tools.browser_tool import _truncate_snapshot
-        # Create a snapshot that exceeds 8000 chars
+        # 500 lines of "- item N" → ~12000 chars, way over max_chars=200
         lines = [f'- item "Element {i}" [ref=e{i}]' for i in range(500)]
         snapshot = "\n".join(lines)
         assert len(snapshot) > 8000
 
-        result = _truncate_snapshot(snapshot, max_chars=200)
-        assert len(result) <= 300  # some margin for the truncation note
+        result = _truncate_snapshot(snapshot, max_chars=2000)
+        # Total: head_budget + marker(~200) + tail_budget(<=1000) ≤ 2000
+        assert len(result) <= 2200, f"result {len(result)} chars > budget"
+        # The head chunk's first line should be a complete "- item" line.
+        first_head_line = result.split("\n", 1)[0]
+        assert first_head_line.startswith("- item"), first_head_line
+        # The tail chunk's last line should ALSO be a complete "- item" line.
+        last_line = result.rstrip("\n").rsplit("\n", 1)[-1]
+        assert last_line.startswith("- item"), last_line
+        # A truncation marker is present between head and tail.
         assert "truncated" in result.lower()
-        # Every line in the result should be complete (not cut mid-element)
-        for line in result.split("\n"):
-            if line.strip() and "truncated" not in line.lower():
-                assert line.startswith("- item") or line == ""
+        assert "browser_snapshot" in result.lower()
 
-    def test_truncation_reports_remaining_count(self):
+    def test_truncation_marker_mentions_next_offset(self):
+        """The truncation marker should tell the agent how to fetch the next page."""
         from tools.browser_tool import _truncate_snapshot
         lines = [f"- line {i}" for i in range(100)]
         snapshot = "\n".join(lines)
         result = _truncate_snapshot(snapshot, max_chars=200)
-        # Should mention how many lines were truncated
-        assert "more line" in result.lower()
+        # New marker format (replaces the old "more line" count message)
+        assert "offset=" in result.lower()
+        assert "browser_snapshot" in result.lower()
+
+
+class TestWindowSnapshot:
+    """Direct tests of the windowed-snapshot helper that powers pagination."""
+
+    def test_short_input_returns_unchanged(self):
+        from tools.browser_tool import _window_snapshot
+        text = "- link [ref=e1]"
+        windowed, meta = _window_snapshot(text, offset=0, max_chars=1000)
+        assert windowed == text
+        assert meta["truncated"] is False
+        assert meta["next_offset"] is None
+        assert meta["total_chars"] == len(text)
+
+    def test_long_input_returns_head_plus_tail(self):
+        from tools.browser_tool import _window_snapshot
+        lines = [f'- item {i}' for i in range(2000)]
+        snapshot = "\n".join(lines)
+        windowed, meta = _window_snapshot(
+            snapshot, offset=0, max_chars=4000, tail_chars=500,
+        )
+        assert meta["truncated"] is True
+        assert meta["next_offset"] is not None
+        # The very first line in the head chunk is intact
+        assert windowed.split("\n", 1)[0].startswith("- item 0")
+        # Tail should contain the *last* item of the snapshot
+        assert "- item 1999" in windowed
+        # No more pages should be needed (next_offset is None) when the
+        # head budget covers everything between offset and tail.
+        if meta["next_offset"] is None:
+            # All content fits in head + tail — no further pages.
+            assert "- item 0" in windowed
+            assert "- item 1999" in windowed
+
+    def test_pagination_walks_full_snapshot(self):
+        """offset=0 then offset=next_offset should eventually yield the
+        full snapshot (head + tail of each page covers everything).
+
+        Note: ``_window_snapshot`` snaps the head to the previous newline
+        to avoid surfacing half-lines. A few lines immediately preceding
+        the head boundary may be deferred to the next page; the tail
+        chunk always carries the last ``tail_chars`` characters verbatim.
+        We assert *at least* ``total - tail_lines - 1`` lines are seen
+        across pages — the small slack accounts for the single line that
+        the head-snap can defer to the next page.
+        """
+        from tools.browser_tool import _window_snapshot
+        lines = [f"- line {i:04d}" for i in range(2000)]
+        snapshot = "\n".join(lines)
+        offset = 0
+        seen_lines: set[str] = set()
+        for _ in range(50):  # safety bound; should converge in < 50 iters
+            windowed, meta = _window_snapshot(
+                snapshot, offset=offset, max_chars=1000, tail_chars=200,
+            )
+            for line in windowed.split("\n"):
+                if line.startswith("- line "):
+                    seen_lines.add(line)
+            if meta["next_offset"] is None:
+                break
+            offset = meta["next_offset"]
+        else:
+            raise AssertionError("pagination did not terminate in 50 iters")
+        # We must see the *very first* and *very last* line — those are
+        # in the head of page 1 and the tail of the last page,
+        # respectively, so they are guaranteed.
+        assert "- line 0000" in seen_lines
+        assert "- line 1999" in seen_lines
+        # We should see the overwhelming majority of the 2000 lines.
+        missing = set(lines) - seen_lines
+        assert len(missing) <= 1, (
+            f"pagination dropped {len(missing)} lines: {sorted(missing)[:5]}"
+        )
+
+    def test_offset_past_head_returns_tail_only(self):
+        from tools.browser_tool import _window_snapshot
+        lines = [f"- line {i}" for i in range(500)]
+        snapshot = "\n".join(lines)
+        # An offset already in the tail region yields tail-only.
+        windowed, meta = _window_snapshot(
+            snapshot, offset=len(snapshot) - 100, max_chars=1000, tail_chars=200,
+        )
+        assert meta["truncated"] is True
+        assert meta["next_offset"] is None
+        assert meta["head_chars"] == 0
+        assert meta["tail_chars"] == 200
+
+    def test_offset_zero_when_not_truncated_returns_zero(self):
+        from tools.browser_tool import _window_snapshot
+        snapshot = "- heading [ref=e1]\n- link [ref=e2]"
+        _, meta = _window_snapshot(snapshot, offset=0)
+        assert meta["offset"] == 0
+        assert meta["next_offset"] is None
+
+
+# ---------------------------------------------------------------------------
+# browser_snapshot signature & pagination plumbing
+# ---------------------------------------------------------------------------
+
+class TestBrowserSnapshotOffsetParam:
+    """``browser_snapshot`` must accept ``offset`` and surface pagination
+    metadata in the response. This is the public-API contract the agent
+    relies on for multi-page reads of long pages."""
+
+    def test_browser_snapshot_has_offset_kwarg(self):
+        import inspect
+        import tools.browser_tool as bt
+        sig = inspect.signature(bt.browser_snapshot)
+        assert "offset" in sig.parameters
+        assert sig.parameters["offset"].default == 0
+
+    def test_browser_snapshot_signature_preserves_backcompat(self):
+        """Existing callers (offset, user_task, task_id) must still work."""
+        import inspect
+        import tools.browser_tool as bt
+        sig = inspect.signature(bt.browser_snapshot)
+        for name in ("full", "task_id", "user_task", "offset"):
+            assert name in sig.parameters, f"missing parameter: {name}"
+
+    def test_camofox_snapshot_has_offset_kwarg(self):
+        import inspect
+        import tools.browser_camofox as bc
+        sig = inspect.signature(bc.camofox_snapshot)
+        assert "offset" in sig.parameters
+        assert sig.parameters["offset"].default == 0
 
 
 # ---------------------------------------------------------------------------

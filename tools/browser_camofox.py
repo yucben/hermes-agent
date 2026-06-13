@@ -489,39 +489,88 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
 
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
-                     user_task: Optional[str] = None) -> str:
-    """Get accessibility tree snapshot from Camofox."""
+                     user_task: Optional[str] = None,
+                     offset: int = 0) -> str:
+    """Get accessibility tree snapshot from Camofox.
+
+    Args:
+        full: If True, return complete snapshot. If False, return compact view.
+        task_id: Task identifier for session isolation.
+        user_task: The user's current task (for task-aware extraction).
+        offset: Character offset for paginated reads of long snapshots.
+            ``0`` (default) returns the first page. Pass the
+            ``next_offset`` from a prior response to continue reading.
+            When ``next_offset`` is ``None``, the page is fully read.
+
+    Returns:
+        JSON string with the page snapshot. When the snapshot is
+        windowed, the response also carries ``truncated``,
+        ``offset``, ``next_offset``, ``total_chars``, ``head_chars``,
+        and ``tail_chars`` so the agent can drive multi-page reads.
+    """
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
+        # Camofox's HTTP server natively paginates snapshots: pass
+        # ``offset`` through when the caller asked for a non-first page.
+        # The server returns a windowed view + a ``truncated`` flag in
+        # the same response shape we use client-side.
+        params: dict = {"userId": session["user_id"]}
+        if offset:
+            params["offset"] = offset
         data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
-            params={"userId": session["user_id"]},
+            params=params,
         )
 
         snapshot = data.get("snapshot", "")
         refs_count = data.get("refsCount", 0)
+        server_truncated = bool(data.get("truncated"))
+        next_offset = data.get("nextOffset")
 
-        # Apply same summarization logic as the main browser tool
+        # Apply same summarization logic as the main browser tool.
+        # Only run on the *first* page (``offset==0``) so subsequent
+        # pages are deterministic windowed chunks (so the agent can
+        # still act on element refs).
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
             _extract_relevant_content,
             _truncate_snapshot,
+            _window_snapshot,
         )
 
+        page_meta: dict = {}
         if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            if user_task:
+            if user_task and offset == 0:
                 snapshot = _extract_relevant_content(snapshot, user_task)
+                if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+                    snapshot, page_meta = _window_snapshot(snapshot, offset=0)
             else:
-                snapshot = _truncate_snapshot(snapshot)
+                # Either no user_task or a non-first page. The server
+                # already returned a windowed view when ``offset`` was
+                # set; for the no-task first-page case we still need to
+                # window client-side.
+                if server_truncated and next_offset is not None:
+                    page_meta = {
+                        "truncated": True,
+                        "offset": offset,
+                        "next_offset": next_offset,
+                        "total_chars": data.get("totalChars", len(snapshot)),
+                    }
+                else:
+                    snapshot, page_meta = _window_snapshot(
+                        snapshot, offset=offset,
+                    )
 
-        return json.dumps({
+        response = {
             "success": True,
             "snapshot": snapshot,
             "element_count": refs_count,
-        })
+        }
+        response.update(page_meta)
+        return json.dumps(response)
     except Exception as e:
         return tool_error(str(e), success=False)
 

@@ -2253,35 +2253,152 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
-def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
-    """Structure-aware truncation for snapshots.
+# Tail chars to preserve for pagination/nav links when windowing long snapshots.
+# Borrowed from camofox-browser's windowSnapshot (lib/snapshot.js): always keep
+# the tail chunk so the agent can still see "Next page" / pagination refs even
+# when the head gets cut off.
+_SNAPSHOT_TAIL_CHARS = 1000
+
+
+def _window_snapshot(
+    snapshot_text: str,
+    offset: int = 0,
+    max_chars: int = SNAPSHOT_SUMMARIZE_THRESHOLD,
+    tail_chars: int = _SNAPSHOT_TAIL_CHARS,
+) -> tuple[str, dict]:
+    """Return a windowed view of a snapshot for paginated access.
+
+    For short snapshots (no truncation needed) returns the input unchanged
+    with ``truncated=False``.
+
+    For long snapshots, returns a *head chunk + tail chunk* string and a
+    metadata dict the caller can use to drive the next page request:
+
+    - ``offset=0`` (default): head chunk sized to leave room for the tail
+      + a marker line, then the last ``tail_chars`` characters of the
+      full snapshot. Use this when you first discover a long page.
+    - ``offset=N>0``: chars [N..N+head_budget) of the full snapshot,
+      followed by the same tail. ``N`` should be the ``next_offset``
+      returned by a prior call.
+    - When ``offset`` is past the head region, only the tail is returned
+      and ``next_offset`` is ``None``.
+
+    This is the "head + tail" windowing strategy from
+    `camofox-browser/lib/snapshot.js <https://github.com/jo-inc/camofox-browser>`_
+    — it preserves pagination/nav links at the end of the page even when
+    the head is cut off, so the agent can always click "Next".
+
+    Args:
+        snapshot_text: Full accessibility-tree snapshot.
+        offset: Character offset to start the head chunk at (0 = start).
+        max_chars: Soft total cap; head + tail + marker should stay
+            within this.
+        tail_chars: How many trailing characters to always preserve.
+
+    Returns:
+        ``(windowed_text, meta)`` where ``meta`` has keys:
+        ``truncated``, ``offset``, ``next_offset`` (``None`` when at the
+        end), ``total_chars``, ``head_chars``, ``tail_chars``.
+    """
+    total = len(snapshot_text)
+    if total <= max_chars:
+        return snapshot_text, {
+            "truncated": False,
+            "offset": 0,
+            "next_offset": None,
+            "total_chars": total,
+            "head_chars": total,
+            "tail_chars": 0,
+        }
+
+    # Budget: head + marker + tail <= max_chars. Marker line ~120 chars worst
+    # case (when truncated) — reserve 200 to be safe.
+    marker_reserve = 200
+    tail_budget = min(tail_chars, max_chars // 2)
+    head_budget = max(0, max_chars - tail_budget - marker_reserve)
+
+    # Clamp offset to the head region. If the caller asks for an offset
+    # already inside the tail, we just return the tail.
+    if offset >= total - tail_budget:
+        tail = snapshot_text[-tail_budget:]
+        return tail, {
+            "truncated": True,
+            "offset": total - tail_budget,
+            "next_offset": None,
+            "total_chars": total,
+            "head_chars": 0,
+            "tail_chars": len(tail),
+        }
+
+    if offset < 0:
+        offset = 0
+    head_end = min(offset + head_budget, total - tail_budget)
+    head = snapshot_text[offset:head_end]
+    tail = snapshot_text[-tail_budget:]
+    has_more = head_end < total - tail_budget
+    next_offset = head_end if has_more else None
+
+    # Snap head to the last newline so we never cut a tree element mid-line.
+    # We keep the *line up to and including* the newline (last_nl + 1) so
+    # the line itself is preserved in the head chunk — only the trailing
+    # line that the snap landed in the middle of gets dropped. The tail
+    # chunk still contains the very last lines, so no content is lost
+    # overall; we just avoid surfacing a half-line in the head.
+    if has_more and "\n" in head:
+        last_nl = head.rfind("\n")
+        if last_nl >= 0:
+            head = head[: last_nl + 1]
+            head_end = offset + last_nl + 1
+            has_more = head_end < total - tail_budget
+            next_offset = head_end if has_more else None
+
+    if has_more:
+        marker = (
+            f"\n[... truncated at char {head_end} of {total}. "
+            f"Call browser_snapshot with offset={head_end} for the next page. "
+            f"Pagination/nav links follow. ...]\n"
+        )
+    else:
+        marker = "\n"
+
+    windowed = head + marker + tail
+    return windowed, {
+        "truncated": True,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total_chars": total,
+        "head_chars": len(head),
+        "tail_chars": len(tail),
+    }
+
+
+def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_THRESHOLD) -> str:
+    """Structure-aware truncation for snapshots. Backward-compatible wrapper.
 
     Cuts at line boundaries so that accessibility tree elements are never
     split mid-line, and appends a note telling the agent how much was
-    omitted.
+    omitted. When the input exceeds ``max_chars``, the tail of the
+    snapshot is *also* preserved (unlike a naive head-only cut) so
+    pagination/nav links remain visible to the agent.
+
+    This is now a thin wrapper around :func:`_window_snapshot` that
+    discards the pagination metadata. Use :func:`_window_snapshot`
+    directly when you need ``next_offset`` to drive multi-page reads.
 
     Args:
         snapshot_text: The snapshot text to truncate
-        max_chars: Maximum characters to keep
+        max_chars: Maximum characters to keep (head + tail + marker)
 
     Returns:
         Truncated text with indicator if truncated
     """
-    if len(snapshot_text) <= max_chars:
-        return snapshot_text
-
-    lines = snapshot_text.split('\n')
-    result: list[str] = []
-    chars = 0
-    for line in lines:
-        if chars + len(line) + 1 > max_chars - 80:  # reserve space for note
-            break
-        result.append(line)
-        chars += len(line) + 1
-    remaining = len(lines) - len(result)
-    if remaining > 0:
-        result.append(f'\n[... {remaining} more lines truncated, use browser_snapshot for full content]')
-    return '\n'.join(result)
+    windowed, _meta = _window_snapshot(
+        snapshot_text,
+        offset=0,
+        max_chars=max_chars,
+        tail_chars=_SNAPSHOT_TAIL_CHARS,
+    )
+    return windowed
 
 
 # ============================================================================
@@ -2499,7 +2616,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 def browser_snapshot(
     full: bool = False,
     task_id: Optional[str] = None,
-    user_task: Optional[str] = None
+    user_task: Optional[str] = None,
+    offset: int = 0,
 ) -> str:
     """
     Get a text-based snapshot of the current page's accessibility tree.
@@ -2508,13 +2626,22 @@ def browser_snapshot(
         full: If True, return complete snapshot. If False, return compact view.
         task_id: Task identifier for session isolation
         user_task: The user's current task (for task-aware extraction)
+        offset: Character offset for paginated reads of long snapshots.
+            ``0`` (default) returns the first page. To continue reading a
+            long page, pass the ``next_offset`` value returned by a prior
+            call. When ``next_offset`` is ``None``, the page is fully
+            read. Snapshots shorter than the window threshold are not
+            paginated regardless of ``offset``.
 
     Returns:
-        JSON string with page snapshot
+        JSON string with page snapshot. When the snapshot is windowed
+        the response also includes ``truncated``, ``offset``,
+        ``next_offset``, ``total_chars``, ``head_chars``,
+        ``tail_chars`` so the caller can drive multi-page reads.
     """
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
-        return camofox_snapshot(full, task_id, user_task)
+        return camofox_snapshot(full, task_id, user_task, offset)
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -2530,17 +2657,39 @@ def browser_snapshot(
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
 
-        # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
-            snapshot_text = _extract_relevant_content(snapshot_text, user_task)
-        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot_text = _truncate_snapshot(snapshot_text)
+        # Window the snapshot so long pages can be read in chunks. We
+        # always use the head+tail windowing strategy (preserves nav
+        # links) — this replaces the old head-only _truncate_snapshot
+        # call. When ``user_task`` is provided, fall back to LLM
+        # summarization only when the snapshot is *very* large (and even
+        # then only on the first page, ``offset==0``); subsequent pages
+        # are raw windowed chunks so the agent can still act on refs.
+        page_meta: dict = {}
+        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+            if user_task and offset == 0:
+                # First page + a user task: LLM-guided summarization.
+                snapshot_text = _extract_relevant_content(snapshot_text, user_task)
+                # If the LLM came back with a much smaller payload, we're
+                # done — no pagination needed. _extract_relevant_content
+                # returns the raw snapshot text on failure, so we
+                # double-check.
+                if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+                    snapshot_text, page_meta = _window_snapshot(
+                        snapshot_text, offset=0,
+                    )
+            else:
+                snapshot_text, page_meta = _window_snapshot(
+                    snapshot_text, offset=offset,
+                )
 
         response = {
             "success": True,
             "snapshot": snapshot_text,
-            "element_count": len(refs) if refs else 0
+            "element_count": len(refs) if refs else 0,
         }
+        # Surface pagination metadata so the agent can drive next-page
+        # reads without guessing.
+        response.update(page_meta)
         _copy_fallback_warning(response, result)
 
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
